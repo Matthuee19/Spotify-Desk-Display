@@ -1,0 +1,785 @@
+/*
+   ESP32 Spotify Desk Display with Album Art
+  
+ Things i still have to do and test after i have all the parts
+
+ PS this is just practice code and i left out my wifi password and name ovisouly and will deal with the spotify api when i am actually building it
+
+   IMPORTANT:
+   1. Configure TFT_eSPI for your ILI9488 before compiling.
+   2. Enter your WiFi credentials below.
+   3. Enter your Spotify access token below.
+   4. The access token expires, so this is NOT the final authentication system.
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>
+
+// ============================================================
+// WIFI
+// ============================================================
+
+const char* WIFI_SSID     = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// ============================================================
+// SPOTIFY
+// ============================================================
+
+// Temporary Spotify access token.
+// Required scope: user-read-currently-playing
+
+const char* SPOTIFY_ACCESS_TOKEN =
+  "YOUR_SPOTIFY_ACCESS_TOKEN";
+
+// ============================================================
+// DISPLAY
+// ============================================================
+
+TFT_eSPI tft = TFT_eSPI();
+
+// Display dimensions in landscape
+#define SCREEN_WIDTH  480
+#define SCREEN_HEIGHT 320
+
+// ============================================================
+// UPDATE SETTINGS
+// ============================================================
+
+unsigned long lastSpotifyUpdate = 0;
+const unsigned long UPDATE_INTERVAL = 3000;
+
+// ============================================================
+// SONG DATA
+// ============================================================
+
+String songName   = "Waiting for Spotify...";
+String artistName = "";
+String albumName  = "";
+
+long progressMS = 0;
+long durationMS = 1;
+
+bool isPlaying        = false;
+bool spotifyAvailable = false;
+
+// Album art URL
+String albumArtUrl = "";
+
+// ============================================================
+// JPEG DECODER CALLBACK
+// ============================================================
+
+// TJpg_Decoder needs a callback to push pixels to the display
+bool tftOutput(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t* bitmap) {
+  // Clip to screen bounds
+  if (y >= SCREEN_HEIGHT || x >= SCREEN_WIDTH) return 0;
+
+  tft.pushImage(x, y, w, h, bitmap);
+  return 1;
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("ESP32 Spotify Display");
+  Serial.println("==============================");
+
+  // ----------------------------------------------------------
+  // DISPLAY
+  // ----------------------------------------------------------
+
+  tft.init();
+  tft.setRotation(1); // Landscape
+  tft.fillScreen(TFT_BLACK);
+
+  // Init JPEG decoder
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(tftOutput);
+
+  drawBootScreen();
+
+  // ----------------------------------------------------------
+  // WIFI
+  // ----------------------------------------------------------
+
+  connectWiFi();
+
+  // ----------------------------------------------------------
+  // INITIAL SPOTIFY REQUEST
+  // ----------------------------------------------------------
+
+  getSpotifyData();
+  drawSpotifyScreen();
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+
+  // ----------------------------------------------------------
+  // Maintain WiFi connection
+  // ----------------------------------------------------------
+
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  // ----------------------------------------------------------
+  // Update Spotify
+  // ----------------------------------------------------------
+
+  if (millis() - lastSpotifyUpdate >= UPDATE_INTERVAL) {
+
+    lastSpotifyUpdate = millis();
+
+    getSpotifyData();
+    drawSpotifyScreen();
+  }
+}
+
+// ============================================================
+// WIFI CONNECTION
+// ============================================================
+
+void connectWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  Serial.println("Connecting to WiFi...");
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+
+  tft.setCursor(40, 120);
+  tft.println("Connecting to WiFi...");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    Serial.println("WiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+  } else {
+
+    Serial.println("WiFi connection failed.");
+  }
+}
+
+// ============================================================
+// DOWNLOAD ALBUM ART
+// ============================================================
+
+bool downloadAlbumArt(String url) {
+
+  if (!spotifyAvailable || url.length() == 0) {
+    return false;
+  }
+
+  Serial.print("Downloading album art: ");
+  Serial.println(url);
+
+  HTTPClient http;
+  http.begin(url);
+
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    Serial.print("Album art HTTP error: ");
+    Serial.println(httpCode);
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  int len = http.getSize();
+
+  // Draw JPEG at album art position (same as placeholder)
+  int x = 25;
+  int y = 70;
+
+  // TJpg_Decoder can read from stream
+  TJpgDec.drawJpg(x, y, *stream, len);
+
+  http.end();
+  return true;
+}
+
+// ============================================================
+// GET SPOTIFY DATA
+// ============================================================
+
+void getSpotifyData() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    spotifyAvailable = false;
+    return;
+  }
+
+  if (strlen(SPOTIFY_ACCESS_TOKEN) < 20) {
+
+    Serial.println("Spotify access token missing.");
+
+    spotifyAvailable = false;
+
+    songName   = "Spotify token missing";
+    artistName = "Add your access token";
+    albumName  = "";
+
+    return;
+  }
+
+  HTTPClient http;
+
+  const char* URL =
+    "https://api.spotify.com/v1/me/player/currently-playing";
+
+  http.begin(URL);
+
+  http.addHeader(
+    "Authorization",
+    String("Bearer ") + SPOTIFY_ACCESS_TOKEN
+  );
+
+  int httpCode = http.GET();
+
+  Serial.print("Spotify HTTP code: ");
+  Serial.println(httpCode);
+
+  // ----------------------------------------------------------
+  // NOTHING PLAYING
+  // ----------------------------------------------------------
+
+  if (httpCode == 204) {
+
+    spotifyAvailable = false;
+
+    songName   = "Nothing playing";
+    artistName = "";
+    albumName  = "";
+
+    progressMS = 0;
+    durationMS = 1;
+
+    albumArtUrl = "";
+
+    http.end();
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // SUCCESS
+  // ----------------------------------------------------------
+
+  if (httpCode == 200) {
+
+    String response = http.getString();
+    Serial.println(response);
+
+    StaticJsonDocument<4096> doc;
+
+    DeserializationError error =
+      deserializeJson(doc, response);
+
+    if (error) {
+
+      Serial.print("JSON error: ");
+      Serial.println(error.c_str());
+
+      spotifyAvailable = false;
+
+      http.end();
+      return;
+    }
+
+    // --------------------------------------------------------
+    // Playback state
+    // --------------------------------------------------------
+
+    isPlaying =
+      doc["is_playing"] | false;
+
+    progressMS =
+      doc["progress_ms"] | 0;
+
+    // --------------------------------------------------------
+    // Track information
+    // --------------------------------------------------------
+
+    JsonObject item =
+      doc["item"];
+
+    if (item.isNull()) {
+
+      spotifyAvailable = false;
+
+      http.end();
+      return;
+    }
+
+    songName =
+      item["name"] | "Unknown Song";
+
+    durationMS =
+      item["duration_ms"] | 1;
+
+    // --------------------------------------------------------
+    // Artist
+    // --------------------------------------------------------
+
+    artistName = "";
+
+    JsonArray artists =
+      item["artists"];
+
+    for (JsonObject artist : artists) {
+
+      if (artistName.length() > 0) {
+        artistName += ", ";
+      }
+
+      artistName +=
+        artist["name"] | "Unknown Artist";
+    }
+
+    // --------------------------------------------------------
+    // Album
+    // --------------------------------------------------------
+
+    JsonObject album =
+      item["album"];
+
+    albumName =
+      album["name"] | "";
+
+    // Album art URL (pick medium size image if available)
+    albumArtUrl = "";
+
+    JsonArray images = album["images"];
+
+    if (!images.isNull() && images.size() > 0) {
+
+      // Prefer index 1 (usually ~300x300), else fallback to 0
+      if (images.size() > 1) {
+        albumArtUrl = images[1]["url"] | "";
+      } else {
+        albumArtUrl = images[0]["url"] | "";
+      }
+    }
+
+    spotifyAvailable = true;
+  }
+
+  // ----------------------------------------------------------
+  // UNAUTHORIZED
+  // ----------------------------------------------------------
+
+  else if (httpCode == 401) {
+
+    Serial.println(
+      "Spotify access token expired or invalid."
+    );
+
+    spotifyAvailable = false;
+
+    songName   = "Spotify authentication";
+    artistName = "Token expired";
+    albumName  = "Replace access token";
+    albumArtUrl = "";
+  }
+
+  // ----------------------------------------------------------
+  // FORBIDDEN
+  // ----------------------------------------------------------
+
+  else if (httpCode == 403) {
+
+    Serial.println(
+      "Spotify denied the request."
+    );
+
+    spotifyAvailable = false;
+
+    songName   = "Spotify permission";
+    artistName = "Access denied";
+    albumName  = "";
+    albumArtUrl = "";
+  }
+
+  // ----------------------------------------------------------
+  // RATE LIMIT
+  // ----------------------------------------------------------
+
+  else if (httpCode == 429) {
+
+    Serial.println(
+      "Spotify rate limited the ESP32."
+    );
+  }
+
+  // ----------------------------------------------------------
+  // OTHER ERROR
+  // ----------------------------------------------------------
+
+  else {
+
+    Serial.print(
+      "Spotify error: "
+    );
+
+    Serial.println(httpCode);
+
+    spotifyAvailable = false;
+  }
+
+  http.end();
+}
+
+// ============================================================
+// BOOT SCREEN
+// ============================================================
+
+void drawBootScreen() {
+
+  tft.fillScreen(TFT_BLACK);
+
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+
+  tft.setCursor(55, 90);
+  tft.println("SPOTIFY");
+
+  tft.setCursor(55, 130);
+  tft.println("DESK DISPLAY");
+
+  tft.setTextSize(2);
+  tft.setCursor(55, 190);
+  tft.println("Starting ESP32...");
+}
+
+// ============================================================
+// MAIN SPOTIFY SCREEN
+// ============================================================
+
+void drawSpotifyScreen() {
+
+  tft.fillScreen(TFT_BLACK);
+
+  // ----------------------------------------------------------
+  // HEADER
+  // ----------------------------------------------------------
+
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+
+  tft.setCursor(20, 15);
+  tft.println("NOW PLAYING");
+
+  // WiFi indicator
+  tft.setTextSize(1);
+  tft.setCursor(390, 18);
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    tft.setTextColor(TFT_GREEN);
+    tft.println("WiFi");
+
+  } else {
+
+    tft.setTextColor(TFT_RED);
+    tft.println("NO WIFI");
+  }
+
+  // ----------------------------------------------------------
+  // SEPARATOR
+  // ----------------------------------------------------------
+
+  tft.drawLine(
+    20,
+    42,
+    460,
+    42,
+    TFT_DARKGREY
+  );
+
+  // ----------------------------------------------------------
+  // ALBUM ART
+  // ----------------------------------------------------------
+
+  // Try to draw album art; if it fails, show placeholder
+  if (!downloadAlbumArt(albumArtUrl)) {
+    drawAlbumPlaceholder();
+  }
+
+  // ----------------------------------------------------------
+  // SONG INFO
+  // ----------------------------------------------------------
+
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+
+  drawWrappedText(
+    songName,
+    220,
+    80,
+    240
+  );
+
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.setTextSize(1);
+
+  drawWrappedText(
+    artistName,
+    220,
+    150,
+    240
+  );
+
+  tft.setTextColor(TFT_DARKGREY);
+
+  drawWrappedText(
+    albumName,
+    220,
+    190,
+    240
+  );
+
+  // ----------------------------------------------------------
+  // PROGRESS BAR
+  // ----------------------------------------------------------
+
+  drawProgressBar();
+
+  // ----------------------------------------------------------
+  // PLAYBACK STATUS
+  // ----------------------------------------------------------
+
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+
+  if (isPlaying) {
+
+    tft.setCursor(225, 280);
+    tft.println("▶");
+
+  } else {
+
+    tft.setCursor(225, 280);
+    tft.println("Ⅱ");
+  }
+}
+
+// ============================================================
+// ALBUM ART PLACEHOLDER
+// ============================================================
+
+void drawAlbumPlaceholder() {
+
+  int x = 25;
+  int y = 70;
+  int size = 170;
+
+  tft.fillRect(
+    x,
+    y,
+    size,
+    size,
+    TFT_DARKGREY
+  );
+
+  tft.drawRect(
+    x,
+    y,
+    size,
+    size,
+    TFT_WHITE
+  );
+
+  // Music note
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(6);
+
+  tft.setCursor(
+    x + 58,
+    y + 50
+  );
+
+  tft.println("♪");
+}
+
+// ============================================================
+// PROGRESS BAR
+// ============================================================
+
+void drawProgressBar() {
+
+  int barX = 25;
+  int barY = 250;
+
+  int barWidth  = 430;
+  int barHeight = 8;
+
+  // Background
+  tft.fillRoundRect(
+    barX,
+    barY,
+    barWidth,
+    barHeight,
+    4,
+    TFT_DARKGREY
+  );
+
+  // Calculate progress
+  float progress = 0;
+
+  if (durationMS > 0) {
+    progress = (float)progressMS / (float)durationMS;
+  }
+
+  if (progress < 0) progress = 0;
+  if (progress > 1) progress = 1;
+
+  int filledWidth = barWidth * progress;
+
+  // Filled portion
+  tft.fillRoundRect(
+    barX,
+    barY,
+    filledWidth,
+    barHeight,
+    4,
+    TFT_GREEN
+  );
+
+  // Current time
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(1);
+
+  tft.setCursor(
+    barX,
+    barY + 15
+  );
+
+  tft.print(
+    formatTime(progressMS)
+  );
+
+  // Duration
+  String total = formatTime(durationMS);
+  int totalWidth = total.length() * 6;
+
+  tft.setCursor(
+    barX + barWidth - totalWidth,
+    barY + 15
+  );
+
+  tft.print(total);
+}
+
+// ============================================================
+// FORMAT TIME
+// ============================================================
+
+String formatTime(long milliseconds) {
+
+  long seconds = milliseconds / 1000;
+  long minutes = seconds / 60;
+  seconds = seconds % 60;
+
+  String result = String(minutes) + ":";
+
+  if (seconds < 10) {
+    result += "0";
+  }
+
+  result += String(seconds);
+  return result;
+}
+
+// ============================================================
+// WRAPPED TEXT
+// ============================================================
+
+void drawWrappedText(
+  String text,
+  int x,
+  int y,
+  int maxWidth
+) {
+
+  if (text.length() == 0) {
+    return;
+  }
+
+  int cursorX = x;
+  int cursorY = y;
+
+  int charWidth = 6;
+  int maxChars = maxWidth / charWidth;
+
+  String currentLine = "";
+
+  for (int i = 0; i < text.length(); i++) {
+
+    char c = text[i];
+
+    if (c == ' ' && currentLine.length() >= maxChars) {
+
+      tft.setCursor(cursorX, cursorY);
+      tft.println(currentLine);
+
+      currentLine = "";
+      cursorY += 16;
+
+      continue;
+    }
+
+    currentLine += c;
+
+    if (currentLine.length() >= maxChars) {
+
+      tft.setCursor(cursorX, cursorY);
+      tft.println(currentLine);
+
+      currentLine = "";
+      cursorY += 16;
+    }
+  }
+
+  if (currentLine.length() > 0) {
+
+    tft.setCursor(cursorX, cursorY);
+    tft.println(currentLine);
+  }
+}
